@@ -50,7 +50,7 @@ auto-detects it by the I2C-HID ACPI id `PNP0C50` / `MSFT0001`.)
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/i2c-hid-touchpad-fixer.git
+git clone https://github.com/viniciusarre/i2c-hid-touchpad-fixer.git
 cd i2c-hid-touchpad-fixer
 sudo ./setup.sh --install
 ```
