@@ -2,3 +2,7 @@
 *~
 *.swp
 .DS_Store
+
+# Local working docs — never commit these
+RESUME.md
+WIKI.md
