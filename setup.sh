@@ -20,7 +20,20 @@ FIXER="$SCRIPT_DIR/touchpad-fixer.sh"
 
 SERVICE_NAME="touchpad-fixer.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
+RESUME_NAME="touchpad-fixer-resume.service"
+RESUME_PATH="/etc/systemd/system/$RESUME_NAME"
+UDEV_RULE_PATH="/etc/udev/rules.d/99-i2c-hid-touchpad-fixer.rules"
 HID_IDS_REGEX='PNP0C50|MSFT0001'
+
+# Print the sysfs name of every I2C-HID device on this machine.
+list_hid_devices() {
+    local dev
+    for dev in /sys/bus/i2c/devices/i2c-*; do
+        [[ -e "$dev/modalias" ]] || continue
+        grep -qE "$HID_IDS_REGEX" "$dev/modalias" 2>/dev/null || continue
+        basename "$dev"
+    done
+}
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -61,9 +74,51 @@ SuccessExitStatus=0 1
 WantedBy=multi-user.target
 EOF
 
+    # Resume unit: force a rebind cycle after waking from suspend/hibernate,
+    # where the touchpad can be stuck-but-still-bound. ExecStartPre gives the
+    # I2C bus a moment to settle before we re-probe.
+    cat > "$RESUME_PATH" <<EOF
+[Unit]
+Description=Reset I2C-HID touchpad after resume from suspend
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 2
+ExecStart=$FIXER --reset
+RemainAfterExit=no
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+EOF
+
+    # udev rule: persistently disable runtime autosuspend on the touchpad so
+    # motion/scroll doesn't freeze. Applied whenever the device (re)appears,
+    # independent of the services. Includes a generic driver match plus an
+    # explicit entry per detected device for reliability.
+    {
+        echo "# Installed by i2c-hid-touchpad-fixer setup.sh"
+        echo "# Disable runtime PM on I2C-HID touchpads to stop intermittent"
+        echo "# cursor/scroll freezes (clicks keep working when motion stalls)."
+        echo 'ACTION=="add|bind", SUBSYSTEM=="i2c", DRIVER=="i2c_hid_acpi", ATTR{power/control}="on"'
+        local name
+        while read -r name; do
+            [[ -n "$name" ]] || continue
+            echo "ACTION==\"add\", SUBSYSTEM==\"i2c\", KERNEL==\"$name\", ATTR{power/control}=\"on\""
+        done < <(list_hid_devices)
+    } > "$UDEV_RULE_PATH"
+    udevadm control --reload-rules 2>/dev/null || true
+
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
-    echo "Installed and enabled $SERVICE_NAME (ExecStart=$FIXER)."
+    systemctl enable "$RESUME_NAME"
+    echo "Installed and enabled:"
+    echo "  $SERVICE_NAME   (runs at boot)"
+    echo "  $RESUME_NAME    (runs after resume from suspend)"
+    echo "  $UDEV_RULE_PATH"
+    echo "     (disables touchpad autosuspend — anti motion-freeze)"
+    echo "ExecStart=$FIXER"
     echo "Running the fixer once now..."
     "$FIXER" || true
 }
@@ -71,9 +126,11 @@ EOF
 do_uninstall() {
     require_root --uninstall
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_PATH"
+    systemctl disable "$RESUME_NAME" 2>/dev/null || true
+    rm -f "$SERVICE_PATH" "$RESUME_PATH" "$UDEV_RULE_PATH"
     systemctl daemon-reload
-    echo "Removed $SERVICE_NAME."
+    udevadm control --reload-rules 2>/dev/null || true
+    echo "Removed $SERVICE_NAME, $RESUME_NAME and the udev rule."
 }
 
 do_run() {
@@ -82,24 +139,36 @@ do_run() {
 }
 
 do_status() {
-    echo "=== service ==="
-    systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || echo "(not installed)"
+    echo "=== services (enabled?) ==="
+    local unit state
+    for unit in "$SERVICE_NAME" "$RESUME_NAME"; do
+        state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+        [[ -z "$state" || "$state" == "not-found" ]] && state="not-installed"
+        printf '  %-30s %s\n' "$unit" "$state"
+    done
     echo
-    echo "=== I2C-HID device bind state ==="
-    local found=0 dev modalias name
+    echo "=== udev anti-freeze rule ==="
+    if [[ -e "$UDEV_RULE_PATH" ]]; then
+        echo "  installed: $UDEV_RULE_PATH"
+    else
+        echo "  not installed"
+    fi
+    echo
+    echo "=== I2C-HID device state (bind + runtime PM) ==="
+    local found=0 dev modalias name bind pm
     for dev in /sys/bus/i2c/devices/i2c-*; do
         [[ -e "$dev/modalias" ]] || continue
         modalias="$(cat "$dev/modalias")"
         [[ "$modalias" =~ $HID_IDS_REGEX ]] || continue
         found=1
         name="$(basename "$dev")"
-        if [[ -e "$dev/driver" ]]; then
-            echo "  $name : BOUND"
-        else
-            echo "  $name : NOT BOUND"
-        fi
+        [[ -e "$dev/driver" ]] && bind="BOUND" || bind="NOT BOUND"
+        pm="$(cat "$dev/power/control" 2>/dev/null || echo '?')"
+        # power/control: "on" = autosuspend disabled (good, anti-freeze)
+        printf '  %-20s bind=%-10s power/control=%s\n' "$name" "$bind" "$pm"
     done
     [[ $found -eq 0 ]] && echo "  (no I2C-HID devices found)"
+    return 0
 }
 
 case "${1:---install}" in

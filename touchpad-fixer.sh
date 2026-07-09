@@ -2,21 +2,29 @@
 #
 # touchpad-fixer.sh
 #
-# Revive an I2C-HID touchpad that failed to bind to its driver at boot.
+# Fix two related failure modes of I2C-HID touchpads on laptops such as the
+# ASUS Zenbook (also seen on various Lenovo / AMD Ryzen machines):
 #
-# On a number of laptops (notably ASUS Zenbooks, but also various Lenovo and
-# AMD Ryzen machines) the I2C-HID touchpad occasionally fails to bind to the
-# `i2c_hid_acpi` driver during boot — usually a reset/init timing issue on the
-# I2C bus. When that happens the touchpad vanishes completely: nothing in
-# `xinput`, `libinput list-devices`, or `/proc/bus/input/devices`, even though
-# the device is still present on the I2C bus.
+#   1. Dead touchpad — the device fails to bind to the `i2c_hid_acpi` driver
+#      at boot, or drops after a suspend/resume cycle. It vanishes from
+#      xinput / libinput / /proc/bus/input/devices even though it's still on
+#      the I2C bus. Fix: (re)bind the driver.
 #
-# This script finds any I2C-HID device (ACPI compatible id PNP0C50 / MSFT0001)
-# that has no driver bound and binds it to `i2c_hid_acpi`. If the direct bind
-# fails it falls back to reloading the i2c_hid modules. It is idempotent: if
-# every touchpad is already bound it does nothing.
+#   2. Motion freeze — clicks still register but sliding/scrolling freezes
+#      intermittently. Caused by runtime power management (autosuspend) putting
+#      the device to sleep and dropping the high-frequency motion packets.
+#      Fix: disable runtime PM (power/control = on) on the device.
 #
-# Usage:  sudo ./touchpad-fixer.sh [--verbose]
+# This script always disables runtime PM on every I2C-HID touchpad it finds,
+# and additionally (re)binds any that are unbound. It is idempotent.
+#
+# Modes:
+#   (default)  Bind any I2C-HID device with NO driver bound. Best for boot.
+#   --reset    Force an unbind+rebind of every I2C-HID device, re-probing it
+#              even if it looks bound. Best for the resume case, where the
+#              device can be bound-but-stuck.
+#
+# Usage:  sudo ./touchpad-fixer.sh [--reset] [--verbose]
 #
 set -euo pipefail
 
@@ -25,8 +33,15 @@ DRIVER_DIR="/sys/bus/i2c/drivers/$DRIVER"
 # ACPI compatible IDs that identify an I2C-HID device in the modalias string.
 HID_IDS_REGEX='PNP0C50|MSFT0001'
 
+RESET=0
 VERBOSE=0
-[[ "${1:-}" == "-v" || "${1:-}" == "--verbose" ]] && VERBOSE=1
+for arg in "$@"; do
+    case "$arg" in
+        -r|--reset)   RESET=1 ;;
+        -v|--verbose) VERBOSE=1 ;;
+        *) echo "Unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
 
 log()  { echo "$@"; }
 vlog() { [[ $VERBOSE -eq 1 ]] && echo "  $*" || true; }
@@ -42,31 +57,36 @@ if [[ ! -d "$DRIVER_DIR" ]]; then
     exit 1
 fi
 
-# Print the sysfs device name of every I2C-HID device that has NO driver bound.
-find_unbound_hid_devices() {
+# Print the sysfs device name of every I2C-HID device (bound or not).
+find_all_hid_devices() {
     local dev modalias
     for dev in /sys/bus/i2c/devices/i2c-*; do
         [[ -e "$dev/modalias" ]] || continue
         modalias="$(cat "$dev/modalias")"
         [[ "$modalias" =~ $HID_IDS_REGEX ]] || continue
-        # A bound device has a "driver" symlink; an unbound one does not.
-        if [[ ! -e "$dev/driver" ]]; then
-            basename "$dev"
-        fi
+        basename "$dev"
     done
 }
 
-# Is a given device name currently bound under our driver?
-is_bound() {
-    [[ -e "$DRIVER_DIR/$1" ]]
+# Print only the I2C-HID devices that have NO driver bound.
+find_unbound_hid_devices() {
+    local name
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        [[ -e "/sys/bus/i2c/devices/$name/driver" ]] || echo "$name"
+    done < <(find_all_hid_devices)
+}
+
+is_bound() { [[ -e "$DRIVER_DIR/$1" ]]; }
+
+unbind_device() {
+    vlog "unbinding $1"
+    echo "$1" > "$DRIVER_DIR/unbind" 2>/dev/null || true
 }
 
 bind_device() {
-    local name="$1"
-    vlog "unbinding stale reference (if any) for $name"
-    echo "$name" > "$DRIVER_DIR/unbind" 2>/dev/null || true
-    vlog "binding $name to $DRIVER"
-    echo "$name" > "$DRIVER_DIR/bind" 2>/dev/null || true
+    vlog "binding $1 to $DRIVER"
+    echo "$1" > "$DRIVER_DIR/bind" 2>/dev/null || true
 }
 
 reload_modules() {
@@ -76,44 +96,76 @@ reload_modules() {
     sleep 1
 }
 
-main() {
-    mapfile -t unbound < <(find_unbound_hid_devices)
+# Disable runtime autosuspend on every present I2C-HID touchpad and its HID
+# child node. Setting power/control=on keeps the device awake so motion
+# packets aren't dropped. Runs every time, since a freshly (re)bound device
+# resets back to "auto".
+disable_runtime_pm() {
+    local dev name f
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        dev="/sys/bus/i2c/devices/$name"
+        for f in "$dev/power/control" "$dev"/*/power/control; do
+            [[ -w "$f" ]] || continue
+            if echo on > "$f" 2>/dev/null; then
+                vlog "runtime PM disabled: $f"
+            fi
+        done
+    done < <(find_all_hid_devices)
+}
 
-    if [[ ${#unbound[@]} -eq 0 ]]; then
-        log "All I2C-HID devices are already bound. Nothing to do."
-        exit 0
+main() {
+    local rc=0
+    local targets=()
+
+    if [[ $RESET -eq 1 ]]; then
+        mapfile -t targets < <(find_all_hid_devices)
+        if [[ ${#targets[@]} -gt 0 ]]; then
+            log "Resetting ${#targets[@]} I2C-HID device(s): ${targets[*]}"
+            for name in "${targets[@]}"; do
+                unbind_device "$name"
+            done
+        fi
+    else
+        mapfile -t targets < <(find_unbound_hid_devices)
+        [[ ${#targets[@]} -gt 0 ]] && \
+            log "Found ${#targets[@]} unbound I2C-HID device(s): ${targets[*]}"
     fi
 
-    log "Found ${#unbound[@]} unbound I2C-HID device(s): ${unbound[*]}"
-
+    # Bind whatever needs binding.
     local still_unbound=()
-    for name in "${unbound[@]}"; do
+    for name in "${targets[@]}"; do
         bind_device "$name"
         if is_bound "$name"; then
-            log "Success: bound $name to $DRIVER."
+            log "Bound $name to $DRIVER."
         else
             still_unbound+=("$name")
         fi
     done
 
-    if [[ ${#still_unbound[@]} -eq 0 ]]; then
-        exit 0
+    if [[ ${#still_unbound[@]} -gt 0 ]]; then
+        log "Direct bind failed for: ${still_unbound[*]}"
+        reload_modules
+        mapfile -t after < <(find_unbound_hid_devices)
+        if [[ ${#after[@]} -gt 0 ]]; then
+            echo "Still unbound after reload: ${after[*]}" >&2
+            echo "A full reboot may be required, or the I2C controller failed" >&2
+            echo "to initialize. Inspect: sudo dmesg | grep -iE 'i2c|hid'" >&2
+            rc=1
+        fi
     fi
 
-    log "Direct bind failed for: ${still_unbound[*]}"
-    reload_modules
+    # Always ensure the anti-freeze setting is applied, even when every device
+    # was already bound (the freeze happens on a bound device).
+    disable_runtime_pm
 
-    # Re-check after the module reload.
-    mapfile -t after < <(find_unbound_hid_devices)
-    if [[ ${#after[@]} -eq 0 ]]; then
-        log "Success: touchpad(s) recovered after module reload."
-        exit 0
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        log "All I2C-HID devices already bound; runtime PM disabled (anti-freeze)."
+    else
+        log "Done: touchpad(s) bound and runtime PM disabled (anti-freeze)."
     fi
 
-    echo "Still unbound after reload: ${after[*]}" >&2
-    echo "A full reboot may be required, or the I2C controller failed to" >&2
-    echo "initialize. Inspect: sudo dmesg | grep -iE 'i2c|hid'" >&2
-    exit 1
+    exit $rc
 }
 
-main "$@"
+main
