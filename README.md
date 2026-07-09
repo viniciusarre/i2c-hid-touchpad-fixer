@@ -47,6 +47,22 @@ Example on an affected machine:
 `ASUE120C` is the ASUS/ELAN touchpad; yours may differ — everything here
 auto-detects the device by the I2C-HID ACPI id (`PNP0C50` / `MSFT0001`).
 
+### Is it software or hardware?
+
+If the touchpad keeps misbehaving in *different* ways (dead, freezing,
+phantom/stuck input), run the diagnostics — ideally **with `sudo`, right after
+a failure**, so it can read the kernel log:
+
+```bash
+sudo ./touchpad-diagnose.sh
+```
+
+It reports your model/BIOS, bind + power state, the input layer, and counts
+I2C/HID error lines (reset/timeout/CRC/incomplete-report) *in touchpad
+context*. A non-zero error count points to a signal/hardware/firmware problem
+(loose FPC connector, failing module, or an old BIOS) rather than something the
+rebind workaround can durably fix.
+
 ## Install
 
 ```bash
