@@ -22,7 +22,15 @@ SERVICE_NAME="touchpad-fixer.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 RESUME_NAME="touchpad-fixer-resume.service"
 RESUME_PATH="/etc/systemd/system/$RESUME_NAME"
+WATCHDOG_NAME="touchpad-watchdog.service"
+WATCHDOG_PATH="/etc/systemd/system/$WATCHDOG_NAME"
+WATCHDOG_SCRIPT="$SCRIPT_DIR/touchpad-watchdog.sh"
 UDEV_RULE_PATH="/etc/udev/rules.d/99-i2c-hid-touchpad-fixer.rules"
+# Root-owned copy of the fixer, referenced by the passwordless-sudo rule so the
+# reset hotkey never prompts. Kept root-owned (not the home-dir copy) so the
+# NOPASSWD rule can't be abused by editing a user-writable script.
+INSTALLED_FIXER="/usr/local/sbin/touchpad-fixer"
+SUDOERS_PATH="/etc/sudoers.d/touchpad-fixer"
 HID_IDS_REGEX='PNP0C50|MSFT0001'
 
 # Print the sysfs name of every I2C-HID device on this machine.
@@ -110,15 +118,53 @@ EOF
     } > "$UDEV_RULE_PATH"
     udevadm control --reload-rules 2>/dev/null || true
 
+    # Watchdog: auto-rebind the moment the touchpad silently drops mid-session.
+    chmod +x "$WATCHDOG_SCRIPT"
+    cat > "$WATCHDOG_PATH" <<EOF
+[Unit]
+Description=Watchdog: auto-rebind I2C-HID touchpad if it drops mid-session
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=$WATCHDOG_SCRIPT
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Hotkey support: root-owned fixer copy + scoped passwordless-sudo rule so a
+    # keybinding can run `sudo touchpad-fixer --reset` without a prompt.
+    install -m 0755 -o root -g root "$FIXER" "$INSTALLED_FIXER"
+    local target_user="${SUDO_USER:-$(stat -c '%U' "$SCRIPT_DIR")}"
+    local tmp_sudoers
+    tmp_sudoers="$(mktemp)"
+    echo "$target_user ALL=(root) NOPASSWD: $INSTALLED_FIXER --reset" > "$tmp_sudoers"
+    if visudo -cf "$tmp_sudoers" >/dev/null 2>&1; then
+        install -m 0440 -o root -g root "$tmp_sudoers" "$SUDOERS_PATH"
+        echo "Passwordless reset enabled for user '$target_user'."
+    else
+        echo "WARNING: generated sudoers rule failed validation; skipping." >&2
+    fi
+    rm -f "$tmp_sudoers"
+
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
     systemctl enable "$RESUME_NAME"
+    systemctl enable --now "$WATCHDOG_NAME"
     echo "Installed and enabled:"
     echo "  $SERVICE_NAME   (runs at boot)"
     echo "  $RESUME_NAME    (runs after resume from suspend)"
+    echo "  $WATCHDOG_NAME  (auto-rebinds on silent drop)"
     echo "  $UDEV_RULE_PATH"
     echo "     (disables touchpad autosuspend — anti motion-freeze)"
-    echo "ExecStart=$FIXER"
+    echo "  $SUDOERS_PATH  +  $INSTALLED_FIXER  (reset hotkey support)"
+    echo
+    echo "To bind the reset to a key, add this to your WM/DE (i3 example):"
+    echo "  bindsym \$mod+Shift+t exec --no-startup-id sudo $INSTALLED_FIXER --reset"
+    echo
     echo "Running the fixer once now..."
     "$FIXER" || true
 }
@@ -127,10 +173,12 @@ do_uninstall() {
     require_root --uninstall
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$RESUME_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_PATH" "$RESUME_PATH" "$UDEV_RULE_PATH"
+    systemctl disable --now "$WATCHDOG_NAME" 2>/dev/null || true
+    rm -f "$SERVICE_PATH" "$RESUME_PATH" "$WATCHDOG_PATH" "$UDEV_RULE_PATH" \
+          "$SUDOERS_PATH" "$INSTALLED_FIXER"
     systemctl daemon-reload
     udevadm control --reload-rules 2>/dev/null || true
-    echo "Removed $SERVICE_NAME, $RESUME_NAME and the udev rule."
+    echo "Removed services, watchdog, udev rule, sudoers rule and installed fixer."
 }
 
 do_run() {
@@ -141,11 +189,18 @@ do_run() {
 do_status() {
     echo "=== services (enabled?) ==="
     local unit state
-    for unit in "$SERVICE_NAME" "$RESUME_NAME"; do
+    for unit in "$SERVICE_NAME" "$RESUME_NAME" "$WATCHDOG_NAME"; do
         state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
         [[ -z "$state" || "$state" == "not-found" ]] && state="not-installed"
         printf '  %-30s %s\n' "$unit" "$state"
     done
+    echo
+    echo "=== reset hotkey support ==="
+    if [[ -e "$SUDOERS_PATH" && -e "$INSTALLED_FIXER" ]]; then
+        echo "  installed (sudoers + $INSTALLED_FIXER)"
+    else
+        echo "  not installed"
+    fi
     echo
     echo "=== udev anti-freeze rule ==="
     if [[ -e "$UDEV_RULE_PATH" ]]; then

@@ -71,14 +71,34 @@ cd i2c-hid-touchpad-fixer
 sudo ./setup.sh --install
 ```
 
-`--install` sets up three things (all idempotent) and runs the fix once
+`--install` sets up everything below (all idempotent) and runs the fix once
 immediately:
 
 - `touchpad-fixer.service` — runs at **boot**, rebinds the touchpad if needed.
 - `touchpad-fixer-resume.service` — runs after **resume from suspend**, force
   re-probing the device (which can be stuck-but-bound on wake).
+- `touchpad-watchdog.service` — a poll loop that **auto-rebinds the moment the
+  touchpad silently drops** mid-session (catches the "goes dead" case).
 - `99-i2c-hid-touchpad-fixer.rules` — a udev rule that **disables autosuspend**
   on the touchpad whenever it appears, preventing the motion freeze.
+- A scoped **passwordless-sudo** rule + a root-owned copy of the fixer at
+  `/usr/local/sbin/touchpad-fixer`, so you can bind a **reset hotkey**. Add to
+  your WM/DE (i3 example):
+  ```
+  bindsym $mod+Shift+t exec --no-startup-id sudo /usr/local/sbin/touchpad-fixer --reset
+  ```
+  The hotkey covers the *bound-but-dead* hangs (freeze / stuck-scroll) that a
+  bind-poll watchdog can't detect.
+
+### A note on the touchpad-toggle key
+
+Many ASUS laptops have a **touchpad enable/disable toggle** (often **Fn+F6**,
+emitting `XF86TouchpadToggle`). On some models toggling it *off* unbinds the
+I2C-HID device — which looks identical to a "crash" (device gone, **no kernel
+errors**, a rebind brings it back). If your touchpad keeps dying silently, rule
+this out first: press the toggle key and watch whether the device disappears in
+`./setup.sh --status`. If that's the cause, the watchdog will auto-recover it,
+or you can remap/disable the key.
 
 ## Usage
 
