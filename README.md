@@ -90,6 +90,17 @@ immediately:
   The hotkey covers the *bound-but-dead* hangs (freeze / stuck-scroll) that a
   bind-poll watchdog can't detect.
 
+When the fixer actually rebinds/resets a touchpad it pops a **desktop
+notification** ("Touchpad reset ✓" / "Touchpad recovered ✓"), so you get
+confirmation the hotkey worked. Requires `libnotify` (`notify-send`); it's a
+no-op if that's missing or there's no graphical session. Silence it with
+`TOUCHPAD_FIXER_NOTIFY=0`.
+
+> **Tip:** if you'd rather trigger the reset with the hardware touchpad key
+> (Fn+F6 on many ASUS models), bind `XF86TouchpadToggle` to
+> `sudo /usr/local/sbin/touchpad-fixer --reset` in your WM instead of a custom
+> chord.
+
 ### A note on the touchpad-toggle key
 
 Many ASUS laptops have a **touchpad enable/disable toggle** (often **Fn+F6**,

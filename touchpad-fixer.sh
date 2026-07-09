@@ -114,6 +114,30 @@ disable_runtime_pm() {
     done < <(find_all_hid_devices)
 }
 
+# Send a desktop notification into the graphical user's session. The fixer
+# runs as root (via sudo / systemd), so we drop to the target user and point at
+# their D-Bus session. Silently no-ops if notify-send is missing or no session
+# is found (e.g. at boot). Disable with TOUCHPAD_FIXER_NOTIFY=0.
+notify_user() {
+    [[ "${TOUCHPAD_FIXER_NOTIFY:-1}" == "0" ]] && return 0
+    command -v notify-send >/dev/null 2>&1 || return 0
+    local urgency="$1" title="$2" body="$3"
+    local u uid
+    u="${SUDO_USER:-}"
+    if [[ -z "$u" ]]; then
+        # Fall back to the owner of an active /run/user/<uid> session bus.
+        u="$(who 2>/dev/null | awk 'NR==1{print $1}')"
+    fi
+    [[ -n "$u" ]] || return 0
+    uid="$(id -u "$u" 2>/dev/null)" || return 0
+    [[ -S "/run/user/$uid/bus" ]] || return 0
+    sudo -u "$u" \
+        DISPLAY="${DISPLAY:-:0}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        notify-send -a "touchpad-fixer" -i input-touchpad -u "$urgency" \
+        "$title" "$body" 2>/dev/null || true
+}
+
 main() {
     local rc=0
     local targets=()
@@ -159,10 +183,18 @@ main() {
     # was already bound (the freeze happens on a bound device).
     disable_runtime_pm
 
-    if [[ ${#targets[@]} -eq 0 ]]; then
-        log "All I2C-HID devices already bound; runtime PM disabled (anti-freeze)."
+    if [[ $rc -ne 0 ]]; then
+        log "Some device(s) could not be recovered."
+        notify_user critical "Touchpad reset failed" "Could not rebind — try again or reboot."
+    elif [[ $RESET -eq 1 ]]; then
+        log "Done: touchpad(s) reset; runtime PM disabled (anti-freeze)."
+        notify_user normal "Touchpad reset ✓" "Rebound ${#targets[@]} device(s); scrolling restored."
+    elif [[ ${#targets[@]} -gt 0 ]]; then
+        log "Done: touchpad(s) bound; runtime PM disabled (anti-freeze)."
+        notify_user normal "Touchpad recovered ✓" "Rebound ${#targets[@]} device(s)."
     else
-        log "Done: touchpad(s) bound and runtime PM disabled (anti-freeze)."
+        # Nothing changed — stay quiet to avoid boot/watchdog notification noise.
+        log "All I2C-HID devices already bound; runtime PM disabled (anti-freeze)."
     fi
 
     exit $rc
